@@ -14,14 +14,14 @@ from spectralAnalysis import *
 
 RATE = 44100
 DEVICE = 1
-OUTPUT_DEVICE = 2
+OUTPUT_DEVICE = 0
 CHANNELS = 1
 BLOCK_SIZE = 1024
 WINDOW_TYPE = "hann"
 PSD_METHOD = "bartlett"
 
 WAVEFORM_DURATION = 0.5
-SPECTRUM_DURATION = 0.5
+PSD_DURATION = 0.5
 BUFFER_DURATION = 3.0
 SNAPSHOT_DURATION = 3.0
 
@@ -39,7 +39,7 @@ class realtimeTracking:
     def __init__(self,
                  samplingRate: Optional[float] = RATE,
                  waveformDuration: Optional[float] = WAVEFORM_DURATION,
-                 spectrumDuration: Optional[float] = SPECTRUM_DURATION,
+                 psdDuration: Optional[float] = PSD_DURATION,
                  bufferDuration: Optional[float] = BUFFER_DURATION,
                  snapshotDuration: Optional[float] = SNAPSHOT_DURATION,
                  windowType: Optional[str] = WINDOW_TYPE,
@@ -54,12 +54,12 @@ class realtimeTracking:
         self.blockSize = blockSize
 
         self.waveformDuration = waveformDuration
-        self.spectrumDuration = spectrumDuration
+        self.psdDuration = psdDuration
         self.bufferDuration = bufferDuration
         self.snapshotDuration = snapshotDuration
 
         self.nWaveformSamples = int(samplingRate * self.waveformDuration)
-        self.nSpectrumSamples = int(samplingRate * self.spectrumDuration)
+        self.nPSDSamples = int(samplingRate * self.psdDuration)
         self.nBufferSamples = int(samplingRate * self.bufferDuration)
         self.nSnapshotSamples = int(samplingRate * self.snapshotDuration)
 
@@ -73,22 +73,25 @@ class realtimeTracking:
         self.inputStreamLock = threading.Lock()
         self.outputStreamLock = threading.Lock()
         self.snapshotLock = threading.Lock()
+        self.bufferLock = threading.Lock()
+        self.playbackLock = threading.Lock()
 
         self._callbackStatus = collections.deque(maxlen=32)
-        self._pendingPlayback = queue.SimpleQueue()
+        self._pendingPlayback = None
         self._activePlayback = None
-        self._silence = np.zeros(BLOCK_SIZE)
+        self._silence = np.zeros(self.blockSize, dtype=np.float32)
 
         self.captureEnabled = True
         self.closingEvent = threading.Event()
 
         self.snapshotRaw = None
         self.snapshotProcessed = None
+
         self.frozenWave = None
-        self.frozenSpectrum = None
+        self.frozenPSDSamples = None
+        self.frozenPSD = None
 
         self.windowType = windowType
-        self.spectrumWindow = getWindow(windowType, self.nSpectrumSamples)
 
         self.inputStream = sd.InputStream(
             samplerate=self.samplingRate,
@@ -107,24 +110,50 @@ class realtimeTracking:
             callback=self.outputCallback,
         )
 
-        self.fig, (self.axWave, self.axSpec) = plt.subplots(2, 1, figsize=(15, 5))
+        self.fig, axs = plt.subplots(2, 2, figsize=(8, 5))
+        self.renderer = self.fig.canvas.get_renderer()
+        self.axWave, self.axPSD = axs[0]
+        self.axSnapshotWave, self.axSnapshotPSD = axs[1]
         self.ani = None
 
-        waveTime = np.arange(self.nWaveformSamples) / self.samplingRate
-        specFreq = np.fft.rfftfreq(self.nSpectrumSamples, d=1.0 / self.samplingRate)
+        self.waveTime = np.arange(self.nWaveformSamples) / self.samplingRate
+        self.psdFreq = np.fft.rfftfreq(self.nPSDSamples, d=1.0 / self.samplingRate)
+        self.snapshotPSDFreq = np.fft.rfftfreq(self.nSnapshotSamples, d=1.0 / self.samplingRate)
 
-        self.plotWave, = self.axWave.plot(waveTime, np.zeros(self.nWaveformSamples))
+        self.frameIndex = 0
+        self.refreshRate = 3
+        self.livePSD = np.zeros(len(self.psdFreq))
+
+        self.plotWave, = self.axWave.plot(self.waveTime, np.zeros(self.nWaveformSamples))
+        self.axWave.set_title("Live waveform")
         self.axWave.set_xlabel("Time (s)")
         self.axWave.set_ylabel("Amplitude")
         self.axWave.set_xlim(0, self.waveformDuration)
         self.axWave.set_ylim(-1, 1)
 
-        self.plotSpec, = self.axSpec.plot(specFreq, np.zeros_like(specFreq))
-        self.axSpec.set_xlabel("Frequency (Hz)")
-        self.axSpec.set_ylabel("Magnitude")
-        self.axSpec.set_xlim(20, 5000)
-        self.axSpec.set_ylim(-1e-6, 1.2e-4)
-        # self.axSpec.set_ylim(-120, 10)
+        self.plotPSD, = self.axPSD.plot(self.psdFreq, np.zeros_like(self.psdFreq))
+        self.axPSD.set_title("Live PSD")
+        self.axPSD.set_xlabel("Frequency (Hz)")
+        self.axPSD.set_ylabel("Magnitude")
+        self.axPSD.set_xlim(20, 5000)
+        self.axPSD.set_ylim(-1e-6, 1.2e-5)
+        # self.axPSD.set_ylim(-120, 10)
+
+        self.snapshotWaveRaw, = self.axSnapshotWave.plot([], [])
+        self.snapshotWaveProcessed, = self.axSnapshotWave.plot([], [])
+        self.axSnapshotWave.set_title("Snapshot waveform")
+        self.axSnapshotWave.set_xlabel("Time (s)")
+        self.axSnapshotWave.set_ylabel("Amplitude")
+        self.axSnapshotWave.set_xlim(0, self.snapshotDuration)
+        self.axSnapshotWave.set_ylim(-1, 1)
+
+        self.snapshotPSDRaw, = self.axSnapshotPSD.plot([], [])
+        self.snapshotPSDProcessed, = self.axSnapshotPSD.plot([], [])
+        self.axSnapshotPSD.set_title("Snapshot PSD")
+        self.axSnapshotPSD.set_xlabel("Frequency (Hz)")
+        self.axSnapshotPSD.set_ylabel("Magnitude")
+        self.axSnapshotPSD.set_xlim(20, 5000)
+        self.axSnapshotPSD.set_ylim(-1e-6, 1.2e-5)
 
     def audioCallback(self, indata, frames, time, status):
         if status:
@@ -134,25 +163,27 @@ class realtimeTracking:
 
         x = indata[:, 0]
         signalLength = len(x)
-        endPos = self.writePos + signalLength
-        if endPos <= self.nBufferSamples:
-            self.buffer[self.writePos:endPos] = x
-        else:
-            i0 = self.nBufferSamples - self.writePos
-            self.buffer[self.writePos:] = x[:i0]
-            self.buffer[:endPos % self.nBufferSamples] = x[i0:]
 
-        self.writePos = endPos % self.nBufferSamples
-        self.filledSamples = min(self.nBufferSamples, self.filledSamples + signalLength)
+        with self.bufferLock:
+            endPos = self.writePos + signalLength
+            if endPos <= self.nBufferSamples:
+                self.buffer[self.writePos:endPos] = x
+            else:
+                i0 = self.nBufferSamples - self.writePos
+                self.buffer[self.writePos:] = x[:i0]
+                self.buffer[:endPos % self.nBufferSamples] = x[i0:]
+
+            self.writePos = endPos % self.nBufferSamples
+            self.filledSamples = min(self.nBufferSamples, self.filledSamples + signalLength)
 
     def outputCallback(self, outdata, frames, time, status):
         if status:
             self._callbackStatus.append(str(status))
 
-        try:
-            self._activePlayback = self._pendingPlayback.get_nowait()
-        except queue.Empty:
-            pass
+        with self.playbackLock:
+            if self._pendingPlayback is not None:
+                self._activePlayback = self._pendingPlayback
+                self._pendingPlayback = None
 
         outdata[:, 0] = self._silence[:frames]
         if self._activePlayback is not None:
@@ -167,11 +198,12 @@ class realtimeTracking:
         available = min(nSamples, self.filledSamples)
         if available == 0:
             if pad:
-                return np.zeros(nSamples)
-            return np.zeros(0)
+                return np.zeros(nSamples, dtype=np.float32)
+            return np.zeros(0, dtype=np.float32)
 
         i0 = (self.writePos - available) % self.nBufferSamples
         endPos = i0 + available
+
         if endPos <= self.nBufferSamples:
             samples = self.buffer[i0:endPos].copy()
         else:
@@ -180,7 +212,7 @@ class realtimeTracking:
 
         if not pad or available == nSamples:
             return samples
-        padded = np.zeros(nSamples)
+        padded = np.zeros(nSamples, dtype=np.float32)
         padded[-available:] = samples
         return padded
 
@@ -189,7 +221,8 @@ class realtimeTracking:
                nSegment: Optional[int] = 10,
                windowType: Optional[str] = "hann",
                overlap: Optional[float] = 0.5,
-               windowLength: Optional[int] = 10001):
+               windowLength: Optional[int] = 10001,
+               targetFrequencies=None):
         x = x - np.mean(x)
         method = method.strip().lower()
 
@@ -212,60 +245,79 @@ class realtimeTracking:
         else:
             raise ValueError(f"Unsupported PSD method")
 
-        targetFrequencies = np.fft.rfftfreq(len(x), d=1.0 / self.samplingRate)
+        if targetFrequencies is None:
+            return psd
+        if np.array_equal(frequencies, targetFrequencies):
+            return psd
+
         psd = np.interp(targetFrequencies, frequencies, psd)
         # return 10 * np.log10(np.maximum(psd, 1e-12))
         return psd
 
     def pause(self):
         self.captureEnabled = False
-        raw = self.getSamples(self.nSnapshotSamples, pad=False)
-        wave = self.getSamples(self.nWaveformSamples, pad=True)
-        spec = self.getSamples(self.nSpectrumSamples, pad=True)
-        return raw, wave, spec
+        with self.bufferLock:
+            raw = self.getSamples(self.nSnapshotSamples, pad=False)
+            wave = self.getSamples(self.nWaveformSamples, pad=True)
+            psdSamples = self.getSamples(self.nPSDSamples, pad=True)
+        return raw, wave, psdSamples
     
     def resume(self):
         self.captureEnabled = True
         with self.snapshotLock:
             self.frozenWave = None
-            self.frozenSpectrum = None
+            self.frozenPSDSamples = None
+            self.frozenPSD = None
         
     def update(self, frame):
         if self.closingEvent.is_set() or not plt.fignum_exists(self.fig.number):
-            return self.plotWave, self.plotSpec
+            return self.plotWave, self.plotPSD
         
         while self._callbackStatus:
             print(f"Warning: {self._callbackStatus.popleft()}")
 
         with self.snapshotLock:
             frozenWave = None if self.frozenWave is None else self.frozenWave.copy()
-            frozenSpectrum = None if self.frozenSpectrum is None else self.frozenSpectrum.copy()
+            frozenPSD = None if self.frozenPSD is None else self.frozenPSD.copy()
 
         if frozenWave is None:
-            wave = self.getSamples(self.nWaveformSamples)
-            spec = self.getSamples(self.nSpectrumSamples)
+            with self.bufferLock:
+                wave = self.getSamples(self.nWaveformSamples)
+                psdSamples = self.getSamples(self.nPSDSamples)
+
+            if (self.frameIndex % self.refreshRate) == 0:
+                self.livePSD = self.estPSD(psdSamples, method=PSD_METHOD, windowType=self.windowType, targetFrequencies=self.psdFreq)
+            self.frameIndex += 1
+            psd = self.livePSD
+
         else:
             wave = frozenWave
-            spec = frozenSpectrum
-
-        spec = self.estPSD(spec, method=PSD_METHOD, windowType=self.windowType)
+            psd = frozenPSD
         
         self.plotWave.set_ydata(wave)
-        self.plotSpec.set_ydata(spec)
+        self.plotPSD.set_ydata(psd)
 
-        return self.plotWave, self.plotSpec
+        return self.plotWave, self.plotPSD
+
+    def stop(self):
+        self._shutdown()
+        if plt.fignum_exists(self.fig.number):
+            plt.close(self.fig)
 
     def onKey(self, event):
         if event.key == "s":
-            raw, wave, spec = self.pause()
+            raw, wave, psdSamples = self.pause()
             if raw.size == 0:
                 self.captureEnabled = True
                 print("No audio captured")
                 return
 
+            psd = self.estPSD(psdSamples, method=PSD_METHOD, windowType=self.windowType, targetFrequencies=self.psdFreq)
+
             with self.snapshotLock:
                 self.frozenWave = wave
-                self.frozenSpectrum = spec
+                self.frozenPSDSamples = psdSamples
+                self.frozenPSD = psd
 
             try:
                 processed = self.processAudio(raw, self.samplingRate)
@@ -273,7 +325,8 @@ class realtimeTracking:
                 self.captureEnabled = True
                 with self.snapshotLock:
                     self.frozenWave = wave
-                    self.frozenSpectrum = spec
+                    self.frozenPSDSamples = psdSamples
+                    self.frozenPSD = psd
                 print(err)
                 return
 
@@ -337,11 +390,6 @@ class realtimeTracking:
         print("Stream stopped")
         self._cleanup()
 
-    def stop(self):
-        self._shutdown()
-        if plt.fignum_exists(self.fig.number):
-            plt.close(self.fig)
-
     def saveSnapshot(self):
         with self.snapshotLock:
             raw = None if self.snapshotRaw is None else self.snapshotRaw.copy()
@@ -359,7 +407,9 @@ class realtimeTracking:
         if x is None:
             print("No snapshot available")
             return
-        self._pendingPlayback.put((x.copy(), 0))
+
+        with self.playbackLock:
+            self._pendingPlayback = (x.copy(), 0)
         print(f"Queued {snapshotType}")
 
     def plotSnapshot(self):
@@ -370,30 +420,23 @@ class realtimeTracking:
         if raw is None or processed is None:
             print("No snapshot available")
             return
-        
+
         t = np.arange(len(raw)) / self.samplingRate
+        f = self.snapshotPSDFreq
 
-        rawPSD = self.estPSD(raw)
-        processedPSD = self.estPSD(processed)
-        f = np.fft.rfftfreq(len(raw), d=1.0 / self.samplingRate)
+        rawPSD = self.estPSD(raw, targetFrequencies=self.snapshotPSDFreq)
+        processedPSD = self.estPSD(processed, targetFrequencies=self.snapshotPSDFreq)
 
-        _, axs = plt.subplots(2, 1, figsize=(20, 10))
-        axs = axs.flatten()
+        self.snapshotWaveRaw.set_data(t, raw)
+        self.snapshotWaveProcessed.set_data(t, processed)
+        self.axSnapshotWave.set_xlim(0, len(raw) / self.samplingRate)
 
-        axs[0].plot(t, raw)
-        axs[0].plot(t, processed)
-        axs[0].set_xlabel("Time (s)")
-        axs[0].set_ylabel("Amplitude")
-        axs[0].set_xlim(0, len(raw) / self.samplingRate)
-        
-        axs[1].plot(f, rawPSD)
-        axs[1].plot(f, processedPSD)
-        axs[1].set_xlabel("Frequency (Hz)")
-        axs[1].set_ylabel("Magnitude")
-        axs[1].set_xlim(0, 5000)
+        self.snapshotPSDRaw.set_data(f, rawPSD)
+        self.snapshotPSDProcessed.set_data(f, processedPSD)
+        self.axSnapshotPSD.set_xlim(20, 5000)
 
-        plt.tight_layout()
-        plt.show()
+        for i in [self.snapshotWaveRaw, self.snapshotWaveProcessed, self.snapshotPSDRaw, self.snapshotPSDProcessed]:
+            i.draw(self.renderer)
 
     @staticmethod
     def processAudio(x, samplingRate):
@@ -405,8 +448,8 @@ class realtimeTracking:
     
     @staticmethod
     def floatToInt16(x):
-        x = np.clip(x, -1.0, 1.0)
-        return (x * 32767).astype(np.int16)
+        x = np.clip(x, -2.0, 2.0)
+        return (x * 16383).astype(np.int16)
 
     def run(self):
         for k in CONFLICT_KEYMAPS:
