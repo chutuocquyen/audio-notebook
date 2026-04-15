@@ -121,19 +121,18 @@ def getWelch(x, samplingRate, numSegment=10, windowType="rect", overlap=0.5):
     return psd, frequencies
 
 # STFT
-def getSpectrogram(x, samplingRate, M, windowType="hamming"):
-    window = getWindow(windowType, M)
+def getSpectrogram(x, samplingRate, windowLength, overlap=0.5, windowType="hamming"):
+    window = getWindow(windowType, windowLength)
 
-    step = M // 4
-    samples = np.arange(0, len(x) - M, step)
-    spectrogram = np.zeros((M // 2 + 1, len(samples)))
+    step = int(windowLength * (1 - overlap))
+    samples = np.arange(0, len(x) - windowLength, step)
+    spectrogram = np.zeros((windowLength // 2 + 1, len(samples)))
     for idx, k in enumerate(samples):
-        windowed = x[k:k + M] * window
+        windowed = x[k:k + windowLength] * window
         X = np.fft.rfft(windowed)
         spectrogram[:, idx] = 20 * np.log10(np.maximum(np.abs(X), 1e-6))    # Amplitude
 
-    # frequencies = np.linspace(0, samplingRate // 2, M // 2 + 1)
-    frequencies = np.fft.rfftfreq(M, d=1 / samplingRate)
+    frequencies = np.fft.rfftfreq(windowLength, d=1 / samplingRate)
     times = samples / samplingRate
     return spectrogram, times, frequencies
 

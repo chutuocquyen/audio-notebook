@@ -1,15 +1,17 @@
 from typing import Optional
 import threading
 import collections
-import queue
 
 import numpy as np
 import scipy as sp
-import matplotlib.pyplot as plt
 import sounddevice as sd
-from matplotlib.animation import FuncAnimation
 
 from spectralAnalysis import *
+
+import matplotlib
+matplotlib.use("QtAgg")
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
 
 
 RATE = 44100
@@ -17,8 +19,16 @@ DEVICE = 1
 OUTPUT_DEVICE = 0
 CHANNELS = 1
 BLOCK_SIZE = 1024
-WINDOW_TYPE = "hann"
+MAX_FREQUENCY = 12000
+
+PSD_WINDOW_TYPE = "rect"
 PSD_METHOD = "bartlett"
+PSD_NUM_SEGMENTS = 10
+PSD_OVERLAP = 0.25
+PSD_REFRESH_RATE = 3
+
+SPECTROGRAM_WINDOW_TYPE = "rect"
+SPECTROGRAM_OVERLAP = 0.5
 
 WAVEFORM_DURATION = 0.5
 PSD_DURATION = 0.5
@@ -42,7 +52,13 @@ class realtimeTracking:
                  psdDuration: Optional[float] = PSD_DURATION,
                  bufferDuration: Optional[float] = BUFFER_DURATION,
                  snapshotDuration: Optional[float] = SNAPSHOT_DURATION,
-                 windowType: Optional[str] = WINDOW_TYPE,
+                 psdWindowType: Optional[str] = PSD_WINDOW_TYPE,
+                 psdMethod: Optional[str] = PSD_METHOD,
+                 psdNumSegments: Optional[int] = PSD_NUM_SEGMENTS,
+                 psdOverlap: Optional[float] = PSD_OVERLAP,
+                 psdRefreshRate: Optional[int] = PSD_REFRESH_RATE,
+                 spectrogramWindowType: Optional[str] = SPECTROGRAM_WINDOW_TYPE,
+                 spectrogramOverlap: Optional[float] = SPECTROGRAM_OVERLAP,
                  device: Optional[int] = DEVICE,
                  outputDevice: Optional[int] = OUTPUT_DEVICE,
                  channels: Optional[int] = CHANNELS,
@@ -91,7 +107,33 @@ class realtimeTracking:
         self.frozenPSDSamples = None
         self.frozenPSD = None
 
-        self.windowType = windowType
+        self.psdWindowType = psdWindowType
+        self.psdMethod = psdMethod.strip().lower()
+        self.psdNumSegments = psdNumSegments
+        self.psdOverlap = psdOverlap
+        self.psdRefreshRate = psdRefreshRate
+        
+        if self.psdMethod == "blackman-tukey":
+            self.psdWindowLength = max(self.blockSize, self.nPSDSamples // 2)
+            self.psdSnapshotWindowLength = max(self.blockSize, self.nSnapshotSamples // 2)
+
+            self.psdWindowLength -= bool(self.psdWindowLength % 2 == 0)
+            self.psdSnapshotWindowLength -= bool(self.psdSnapshotWindowLength % 2 == 0)
+        elif self.psdMethod == "bartlett":
+            self.psdWindowLength = max(self.blockSize, self.nPSDSamples // self.psdNumSegments)
+            self.psdSnapshotWindowLength = max(self.blockSize, self.nSnapshotSamples // self.psdNumSegments)
+        elif self.psdMethod == "welch":
+            self.psdWindowLength = max(self.blockSize, self.nPSDSamples // (1 + (self.psdNumSegments - 1) * (1 - self.psdOverlap)))
+            self.psdSnapshotWindowLength = max(self.blockSize, self.nSnapshotSamples // (1 + (self.psdNumSegments - 1) * (1 - self.psdOverlap)))
+        else:
+            self.psdWindowLength = self.nPSDSamples
+            self.psdSnapshotWindowLength = self.nSnapshotSamples
+
+        self.spectrogramWindowType = spectrogramWindowType
+        self.spectrogramWindowLength = max(self.blockSize, self.nSnapshotSamples // 128)
+        self.spectrogramOverlap = spectrogramOverlap
+
+        self.processFilter = sp.signal.butter(2, [100, 2500], btype="bandpass", fs=self.samplingRate, output="sos")
 
         self.inputStream = sd.InputStream(
             samplerate=self.samplingRate,
@@ -110,10 +152,7 @@ class realtimeTracking:
             callback=self.outputCallback,
         )
 
-        self.fig, axs = plt.subplots(2, 2, figsize=(8, 5))
-        self.renderer = self.fig.canvas.get_renderer()
-        self.axWave, self.axPSD = axs[0]
-        self.axSnapshotWave, self.axSnapshotPSD = axs[1]
+        self.fig, (self.axWave, self.axPSD) = plt.subplots(2, 1, figsize=(6, 5))
         self.ani = None
 
         self.waveTime = np.arange(self.nWaveformSamples) / self.samplingRate
@@ -121,7 +160,6 @@ class realtimeTracking:
         self.snapshotPSDFreq = np.fft.rfftfreq(self.nSnapshotSamples, d=1.0 / self.samplingRate)
 
         self.frameIndex = 0
-        self.refreshRate = 3
         self.livePSD = np.zeros(len(self.psdFreq))
 
         self.plotWave, = self.axWave.plot(self.waveTime, np.zeros(self.nWaveformSamples))
@@ -135,25 +173,16 @@ class realtimeTracking:
         self.axPSD.set_title("Live PSD")
         self.axPSD.set_xlabel("Frequency (Hz)")
         self.axPSD.set_ylabel("Magnitude")
-        self.axPSD.set_xlim(20, 5000)
-        self.axPSD.set_ylim(-1e-6, 1.2e-5)
-        # self.axPSD.set_ylim(-120, 10)
+        self.axPSD.set_xlim(20, MAX_FREQUENCY)
+        self.axPSD.set_ylim(-1e-6, 5e-5)
 
-        self.snapshotWaveRaw, = self.axSnapshotWave.plot([], [])
-        self.snapshotWaveProcessed, = self.axSnapshotWave.plot([], [])
-        self.axSnapshotWave.set_title("Snapshot waveform")
-        self.axSnapshotWave.set_xlabel("Time (s)")
-        self.axSnapshotWave.set_ylabel("Amplitude")
-        self.axSnapshotWave.set_xlim(0, self.snapshotDuration)
-        self.axSnapshotWave.set_ylim(-1, 1)
-
-        self.snapshotPSDRaw, = self.axSnapshotPSD.plot([], [])
-        self.snapshotPSDProcessed, = self.axSnapshotPSD.plot([], [])
-        self.axSnapshotPSD.set_title("Snapshot PSD")
-        self.axSnapshotPSD.set_xlabel("Frequency (Hz)")
-        self.axSnapshotPSD.set_ylabel("Magnitude")
-        self.axSnapshotPSD.set_xlim(20, 5000)
-        self.axSnapshotPSD.set_ylim(-1e-6, 1.2e-5)
+        self.snapshotFig, self.snapshotAxs = None, None
+        self.snapshotWaveRaw = None
+        self.snapshotWaveProcessed = None
+        self.snapshotPSDRaw = None
+        self.snapshotPSDProcessed = None
+        self.snapshotSpectrogramRaw = None
+        self.snapshotSpectrogramProcessed = None
 
     def audioCallback(self, indata, frames, time, status):
         if status:
@@ -216,32 +245,25 @@ class realtimeTracking:
         padded[-available:] = samples
         return padded
 
-    def estPSD(self, x,
-               method: Optional[str] = PSD_METHOD,
-               nSegment: Optional[int] = 10,
-               windowType: Optional[str] = "hann",
-               overlap: Optional[float] = 0.5,
-               windowLength: Optional[int] = 10001,
-               targetFrequencies=None):
+    def estPSD(self, x, windowLength, targetFrequencies=None):
         x = x - np.mean(x)
-        method = method.strip().lower()
+        method = self.psdMethod
 
         if method == "correlogram":
             psd, frequencies = getCorrelogram(x, self.samplingRate)
-
         elif method == "periodogram":
             psd, frequencies = getPeriodogram(x, self.samplingRate)
-        elif method == "blackmantukey":
+        elif method == "blackman-tukey":
             psd, frequencies = getBlackmanTukey(x, self.samplingRate,
-                                                windowType=windowType,
+                                                windowType=self.psdWindowType,
                                                 windowLength=windowLength)
         elif method == "bartlett":
-            psd, frequencies = getBartlett(x, self.samplingRate, numSegment=nSegment)
+            psd, frequencies = getBartlett(x, self.samplingRate, numSegment=self.psdNumSegments)
         elif method == "welch":
             psd, frequencies = getWelch(x, self.samplingRate,
-                                        numSegment=nSegment,
-                                        windowType=windowType,
-                                        overlap=overlap)
+                                        numSegment=self.psdNumSegments,
+                                        windowType=self.psdWindowType,
+                                        overlap=self.psdOverlap)
         else:
             raise ValueError(f"Unsupported PSD method")
 
@@ -251,8 +273,14 @@ class realtimeTracking:
             return psd
 
         psd = np.interp(targetFrequencies, frequencies, psd)
-        # return 10 * np.log10(np.maximum(psd, 1e-12))
         return psd
+
+    def estSpectrogram(self, x):
+        spectrogram, times, frequencies = getSpectrogram(x, self.samplingRate,
+                                                         windowLength=self.spectrogramWindowLength,
+                                                         overlap=self.spectrogramOverlap,
+                                                         windowType=self.spectrogramWindowType)
+        return spectrogram[frequencies <= MAX_FREQUENCY], times, frequencies[frequencies <= MAX_FREQUENCY]
 
     def pause(self):
         self.captureEnabled = False
@@ -285,8 +313,8 @@ class realtimeTracking:
                 wave = self.getSamples(self.nWaveformSamples)
                 psdSamples = self.getSamples(self.nPSDSamples)
 
-            if (self.frameIndex % self.refreshRate) == 0:
-                self.livePSD = self.estPSD(psdSamples, method=PSD_METHOD, windowType=self.windowType, targetFrequencies=self.psdFreq)
+            if (self.frameIndex % self.psdRefreshRate) == 0:
+                self.livePSD = self.estPSD(psdSamples, self.psdWindowLength, targetFrequencies=self.psdFreq)
             self.frameIndex += 1
             psd = self.livePSD
 
@@ -312,7 +340,7 @@ class realtimeTracking:
                 print("No audio captured")
                 return
 
-            psd = self.estPSD(psdSamples, method=PSD_METHOD, windowType=self.windowType, targetFrequencies=self.psdFreq)
+            psd = self.estPSD(psdSamples, self.psdWindowLength, targetFrequencies=self.psdFreq)
 
             with self.snapshotLock:
                 self.frozenWave = wave
@@ -320,7 +348,7 @@ class realtimeTracking:
                 self.frozenPSD = psd
 
             try:
-                processed = self.processAudio(raw, self.samplingRate)
+                processed = self.processAudio(raw)
             except ValueError as err:
                 self.captureEnabled = True
                 with self.snapshotLock:
@@ -424,27 +452,65 @@ class realtimeTracking:
         t = np.arange(len(raw)) / self.samplingRate
         f = self.snapshotPSDFreq
 
-        rawPSD = self.estPSD(raw, targetFrequencies=self.snapshotPSDFreq)
-        processedPSD = self.estPSD(processed, targetFrequencies=self.snapshotPSDFreq)
+        rawPSD = self.estPSD(raw, self.psdSnapshotWindowLength, targetFrequencies=self.snapshotPSDFreq)
+        processedPSD = self.estPSD(processed, self.psdSnapshotWindowLength, targetFrequencies=self.snapshotPSDFreq)
+
+        rawSpectrogram, specTimes, specFreq = self.estSpectrogram(raw)
+        processedSpectrogram, _, _ = self.estSpectrogram(processed)
+
+        if self.snapshotFig is None or not plt.fignum_exists(self.snapshotFig.number):
+            self.snapshotFig, self.snapshotAxs = plt.subplots(2, 2, figsize=(12, 5))
+            axWave, axPSD = self.snapshotAxs[:, 0]
+            axSpectrogramRaw, axSpectrogramProcessed = self.snapshotAxs[:, 1]
+
+            self.snapshotWaveRaw, = axWave.plot([], [])
+            self.snapshotWaveProcessed, = axWave.plot([], [])
+            axWave.set_title("Snapshot waveform")
+            axWave.set_xlabel("Time (s)")
+            axWave.set_ylabel("Amplitude")
+            axWave.set_xlim(0, self.snapshotDuration)
+            axWave.set_ylim(-2, 2)
+
+            self.snapshotPSDRaw, = axPSD.plot([], [])
+            self.snapshotPSDProcessed, = axPSD.plot([], [])
+            axPSD.set_title("Snapshot PSD")
+            axPSD.set_xlabel("Frequency (Hz)")
+            axPSD.set_ylabel("Magnitude")
+            axPSD.set_xlim(20, MAX_FREQUENCY)
+            axPSD.set_ylim(-1e-6, 5e-5)
+
+            self.snapshotSpectrogramRaw = axSpectrogramRaw.imshow(rawSpectrogram, origin="lower", aspect="auto", cmap="turbo",
+                                                                  extent=(specTimes[0], specTimes[-1], specFreq[0], specFreq[-1]),
+                                                                  interpolation="nearest")
+            axSpectrogramRaw.set_title("Raw spectrogram")
+            axSpectrogramRaw.set_xlabel("Time (s)")
+            axSpectrogramRaw.set_ylabel("Frequency (Hz)")
+            self.snapshotSpectrogramProcessed = axSpectrogramProcessed.imshow(processedSpectrogram, origin="lower", aspect="auto", cmap="turbo",
+                                                                              extent=(specTimes[0], specTimes[-1], specFreq[0], specFreq[-1]),
+                                                                              interpolation="nearest")
+            axSpectrogramProcessed.set_title("Processed spectrogram")
+            axSpectrogramProcessed.set_xlabel("Time (s)")
+            axSpectrogramProcessed.set_ylabel("Frequency (Hz)")
+
+            self.snapshotFig.tight_layout()
 
         self.snapshotWaveRaw.set_data(t, raw)
         self.snapshotWaveProcessed.set_data(t, processed)
-        self.axSnapshotWave.set_xlim(0, len(raw) / self.samplingRate)
 
         self.snapshotPSDRaw.set_data(f, rawPSD)
         self.snapshotPSDProcessed.set_data(f, processedPSD)
-        self.axSnapshotPSD.set_xlim(20, 5000)
 
-        for i in [self.snapshotWaveRaw, self.snapshotWaveProcessed, self.snapshotPSDRaw, self.snapshotPSDProcessed]:
-            i.draw(self.renderer)
+        self.snapshotSpectrogramRaw.set_data(rawSpectrogram)
+        self.snapshotSpectrogramProcessed.set_data(processedSpectrogram)
 
-    @staticmethod
-    def processAudio(x, samplingRate):
+        self.snapshotFig.canvas.draw()
+        manager = getattr(self.snapshotFig.canvas, "manager", None)
+        if manager is not None and hasattr(manager, "show"):
+            manager.show()
+
+    def processAudio(self, x):
         x = x - np.mean(x)
-        filter = sp.signal.butter(2, [100, 2500], btype="bandpass", fs=samplingRate, output="sos")
-
-        y = sp.signal.sosfiltfilt(filter, x)
-        return y
+        return sp.signal.sosfiltfilt(self.processFilter, x)
     
     @staticmethod
     def floatToInt16(x):
@@ -458,7 +524,7 @@ class realtimeTracking:
         self.fig.canvas.mpl_connect("key_press_event", self.onKey)
         self.fig.canvas.mpl_connect("close_event", self._shutdown)
 
-        self.ani = FuncAnimation(self.fig, self.update, interval=50, blit=False, cache_frame_data=False)
+        self.ani = FuncAnimation(self.fig, self.update, interval=50, blit=True, cache_frame_data=False)
 
         print("Stream started")
 
